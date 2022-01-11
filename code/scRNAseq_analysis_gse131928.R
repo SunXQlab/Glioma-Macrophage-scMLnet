@@ -1,3 +1,11 @@
+###########################################################################
+#
+# scRNA-seq data processing
+#
+###########################################################################
+
+## library 
+
 library(Seurat)
 library(dplyr)
 library(patchwork)
@@ -5,16 +13,19 @@ library(SeuratWrappers)
 
 library(ggsci)
 library(scales)
+
+rm(list = ls())
+gc()
+
+## color 
+
 mycols <- pal_lancet("lanonc", alpha = 0.7)(9)
 show_col(pal_lancet("lanonc", alpha = 0.7)(9))
 
 mycols_scale <- pal_igv("default", alpha = 0.7)(48)
 show_col(pal_igv("default", alpha = 0.7)(48))
 
-###############################
-## scRNA-seq data processing ##
-###############################
-## download ##########
+## data 
 
 dat <- data.table::fread("./2019_cell/downloaded_data/GSM3828672_Smartseq2_GBM_IDHwt_processed_TPM.tsv.gz")
 dim(dat)
@@ -24,7 +35,7 @@ dat <- as.data.frame(dat)
 rownames(dat) <- dat$GENE
 dat <- dat[,-1]
 
-## run seurat ########
+## run 
 
 wrap_seurat <- function(dat, label){
   
@@ -58,18 +69,15 @@ wrap_seurat <- function(dat, label){
   
 }
 seur <- wrap_seurat(dat, "GBM")
-
-## cluster ########
-
 seur <- FindClusters(seur, resolution = 0.1)
 DimPlot(seur, reduction = "tsne", pt.size = 1)
 
-## imputation ########
-
 seur <- RunALRA(seur)
 DefaultAssay(seur) <- "alra"
+All.markers.alra <- FindAllMarkers(seur, only.pos = TRUE) 
+write.csv(All.markers.alra, "./result/all.markers.alra.csv")
 
-## markers ########
+## annotation
 
 ## macrophages: CD14, AIF1, FCER1G, FCGR3A, TYROBP, CSF1R
 ## T cells: CD2, CD3D, CD3E, CD3G
@@ -98,7 +106,7 @@ pp = pp +
 print(pp)
 # dev.off()
 
-## annotation ########
+## label
 
 seur$orig.annotation <- Idents(seur)
 seur$orig.annotation <- factor(seur$orig.annotation, 
@@ -108,8 +116,6 @@ table(seur$orig.annotation, seur$seurat_clusters)
 
 Idents(seur) <- seur$orig.annotation
 seur$patient <- colnames(seur) %>% lapply(.,function(x){strsplit(x,"-")[[1]][1]}) %>% unlist()
-
-## plot ########
 
 mycols_seur <- mycols[c(1,2,3,5)]
 names(mycols_seur) <- c('Tcell','macrophages','oligodendrocytes','Malignant')
@@ -124,117 +130,153 @@ p2 <- DimPlot(seur, reduction = "tsne", pt.size = 1, group.by = "patient", cols 
 p1+p2
 # dev.off()
 
-## DEGs ########
+## save
 
-All.markers.alra <- FindAllMarkers(seur, only.pos = TRUE) 
-write.csv(All.markers.alra, "./result/all.markers.alra.csv")
-
-## save ########
 saveRDS(seur, "./result/seur.rds")
 
-#############################
-## cell-cell communication ##
-#############################
+###########################################################################
+#
+# CCC Inference 
+#
+###########################################################################
 
-rm(list = ls())
+## library
 
-## load input ###############
+library(Seurat)
+library(dplyr)
 
-seur <- readRDS("./result/seur.rds")
-
-metadata <- data.frame(barcode = rownames(seur@meta.data),
-                       celltype = seur@active.ident)
-
-cts <- metadata$celltype %>% unique()
-meanExprMat <- lapply(cts, function(ct){
-  
-  exprMat <- seur[['alra']]@data
-  meanExpr <- rowMeans(exprMat[, seur@active.ident == ct])
-  
-}) %>% do.call("cbind",.) %>% as.data.frame()
-colnames(meanExprMat) <- cts
-
-AllMarkers <- read.csv("./result/all.markers.alra.csv",row.names = 1)
-DEGs_list <- split(AllMarkers$gene,AllMarkers$cluster)
-
-## load Database ####################
+library(patchwork)
+library(SeuratWrappers)
 
 library(OmnipathR)
 
-ppi_form_kinaseextra <- import_kinaseextra_interactions() 
-ppi_form_omnipath <- import_omnipath_interactions() 
-ppi_form_pathwayextra <- import_pathwayextra_interactions() 
-ppi_from_Omnipath <- rbind(ppi_form_kinaseextra,ppi_form_omnipath,ppi_form_pathwayextra) # 101590 pairs
-ppiDB <- ppi_from_Omnipath %>% dplyr::filter(n_resources>0) %>% 
-  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
-  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
-  dplyr::filter(source %in% rownames(meanExprMat), target %in% rownames(meanExprMat))
+library(Matrix)
+library(dplyr)
 
-LigRecDB <- import_ligrecextra_interactions() # 6456 pair
-LigRecDB <- LigRecDB %>% 
-  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
-  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
-  dplyr::filter(source %in% unique(c(ppiDB$source,ppiDB$target)), 
-                target %in% unique(c(ppiDB$source,ppiDB$target)))
+library(ggsci)
+library(RColorBrewer)
+library(scales)
 
-TFTG_from_dorothea <- import_dorothea_interactions() 
-TFTG_from_tftarget <- import_tf_target_interactions() 
-TFTGDB <- rbind(TFTG_from_dorothea[,-grep("dorothea_level",colnames(TFTG_from_dorothea))],
-                TFTG_from_tftarget) # 77182 pairs
-TFTGDB <- TFTGDB %>% 
-  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
-  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
-  dplyr::filter(source %in% unique(c(ppiDB$source,ppiDB$target)), 
-                target %in% unique(c(ppiDB$source,ppiDB$target))) 
+library(ggplot2)
+library(plotrix)
+library(igraph)
+library(ggraph)
 
-Database <- list(LigRecDB = LigRecDB,
-                 ppiDB = ppiDB,
-                 TFTGDB = TFTGDB)
-saveRDS(Database, "./result/database.rds")
+rm(list = ls())
+gc()
 
-## creat undirected weighted graph ##########
+## function 
 
-V = unique(c(ppiDB$source,ppiDB$target))
-adjM <- matrix(0,nrow = length(V),ncol = length(V), dimnames = list(V,V))
-for(i in 1:nrow(ppiDB)){
+fisher_test <- function(subset1,subset2,backgrond)
+{
+  a=length(intersect(subset1,subset2))
+  b=length(subset1)-a
+  c=length(subset2)-a
+  d=length(backgrond)-a-b-c
+  matrix=matrix(c(a,c,b,d),nrow=2)
+  fisher.test(matrix,alternative="greater")$p.value
+}
+
+getTFTG <- function(TFTG.DB, target.degs, target.genes)
+{
   
-  adjM[ppiDB$source[i],ppiDB$target[i]] <- 1/ppiDB$weight[i]
-  adjM[ppiDB$target[i],ppiDB$source[i]] <- 1/ppiDB$weight[i]
+  if (!is.data.frame(TFTG.DB))
+    stop("TFTG.DB must be a data frame or tibble object")
+  if (!"source" %in% colnames(TFTG.DB))
+    stop("TFTG.DB must contain a column named 'source'")
+  if (!"target" %in% colnames(TFTG.DB))
+    stop("TFTG.DB must contain a column named 'target'")
+  
+  # get TF list
+  TF.list <- TFTG.DB %>% select(source) %>% unlist() %>% unique()
+  
+  # get Target list
+  TG.list <- lapply(TF.list, function(x){
+    TFTG.DB %>% filter(source == x)  %>% select(target) %>% unlist() %>% unique() %>% intersect(.,target.genes)
+  })
+  names(TG.list) <- TF.list
+  
+  # get target differently expressed genes
+  DEGs <- target.degs
+  
+  # perform fisher test
+  TFs <- lapply(TG.list, function(x){fisher_test(subset1 = x, subset2 = DEGs, backgrond = target.genes)})
+  TFs <- unlist(TFs)
+  TFs <- names(TFs)[TFs <= 0.05]
+  TFs <- TFs[TFs %in% target.genes]
+  
+  # get activated LR pairs
+  TFTGList <- TG.list[TFs]
+  TFTGList <- lapply(TFTGList, function(x){intersect(x, DEGs)})
+  TFTGList <- paste(rep(TFs, times = lengths(TFTGList)), unlist(TFTGList), sep = "_")
+  
+  # check result
+  if(length(TFTGList)==0)
+    stop("Error: No significant TFTG pairs")
+  
+  # get result
+  TFTGTable <- TFTGList %>% strsplit(.,split = "_") %>% do.call(rbind, .) %>% as.data.frame()
+  colnames(TFTGTable) <- c("source","target")
+  
+  cat(paste0("get ",length(TFTGList)," activated TFTG pairs\n"))
+  return(TFTGTable)
   
 }
-adjM <- as(adjM, "dgCMatrix")
 
-G <- igraph::graph_from_adjacency_matrix(adjM, mode='undirected', weighted=TRUE)
-# delete loop and multiple edges
-G <- igraph::simplify(G, remove.multiple = TRUE, remove.loops = TRUE)
-# delete isolated nodes
-isolates <- which(degree(G, mode = c("all")) == 0) - 1
-G <- delete.vertices(G, names(isolates))
-
-Receptors <- LigRecDB$target %>% as.character() %>% unique()
-TFs <- TFTGDB$source %>% as.character() %>% unique()
-distM <- lapply(Receptors, function(rec){
+getRecTF <- function(RecTF.DB, Rec.list, TF.list)
+{
   
-  distances(G, v = rec, to = TFs)
+  if (!is.data.frame(RecTF.DB))
+    stop("RecTF.DB must be a data frame or tibble object")
+  if (!"source" %in% colnames(RecTF.DB))
+    stop("RecTF.DB must contain a column named 'source'")
+  if (!"target" %in% colnames(RecTF.DB))
+    stop("RecTF.DB must contain a column named 'target'")
   
-}) %>% do.call("rbind",.) %>% as.data.frame()
-rownames(distM) <- Receptors
-colnames(distM) <- TFs
+  # make sure Rec.list in RecTF.DB
+  Rec.list <- Rec.list[Rec.list %in% RecTF.DB$source]
+  Rec.list <- as.vector(Rec.list)
+  
+  # make sure TF.list in RecTF.DB
+  TF.list <- TF.list[TF.list %in% RecTF.DB$target]
+  TF.list <- as.vector(TF.list)
+  
+  # get TF activated by Receptors
+  TFofRec <- lapply(Rec.list, function(x){
+    RecTF.DB %>% filter(source == x)  %>% select(target) %>% unlist() %>% unique()
+  })
+  names(TFofRec) <- Rec.list
+  
+  # get all TF
+  TFofALL <- RecTF.DB %>% select(target) %>% unlist() %>% unique()
+  
+  # perform fisher test
+  Recs <- lapply(TFofRec, function(x){
+    fisher_test(subset1 = x, subset2 = TF.list, backgrond = TFofALL)
+  })
+  Recs <- unlist(Recs)
+  Recs <- names(Recs)[Recs <= 0.05]
+  
+  # get activated RecTF pairs
+  RecTFList <- TFofRec[Recs]
+  RecTFList <- lapply(RecTFList, function(x){intersect(x, TF.list)})
+  RecTFList <- paste(rep(Recs, times = lengths(RecTFList)), unlist(RecTFList), sep = "_")
+  
+  # check result
+  if(length(RecTFList)==0)
+    stop("Error: No significant RecTF pairs")
+  
+  # get result
+  RecTFTable <- RecTFList %>% strsplit(.,split = "_") %>% do.call(rbind, .) %>% as.data.frame()
+  colnames(RecTFTable) <- c("source","target")
+  
+  cat(paste0("get ",length(RecTFList)," activated RecTF pairs\n"))
+  return(RecTFTable)
+  
+}
 
-score.cutoff = 0.2
-RecTFDB <- distM
-RecTFDB <- cbind(rownames(RecTFDB),RecTFDB)
-RecTFDB <- reshape2::melt(RecTFDB, id = "rownames(RecTFDB)")
-colnames(RecTFDB) <- c('source','target','score')
-RecTFDB <- RecTFDB %>%
-  dplyr::filter(score != Inf, score != 0) %>% # 498940 pairs
-  dplyr::filter(score <= quantile(score, score.cutoff)) # 48856 pairs
-
-saveRDS(RecTFDB, "./result/RecTFDB.rds")
-
-## main function #######
-
-runMLnet <- function(sender,reciver,rank.cutoff=0.2){
+runMLnet <- function(sender,reciver,meanExprMat,rank.cutoff=0.2)
+{
   
   ## get LigRec #################
   
@@ -250,62 +292,6 @@ runMLnet <- function(sender,reciver,rank.cutoff=0.2){
   
   ## get TFTG #################
   
-  fisher_test <- function(subset1,subset2,backgrond)
-  {
-    a=length(intersect(subset1,subset2))
-    b=length(subset1)-a
-    c=length(subset2)-a
-    d=length(backgrond)-a-b-c
-    matrix=matrix(c(a,c,b,d),nrow=2)
-    fisher.test(matrix,alternative="greater")$p.value
-  }
-  
-  getTFTG <- function(TFTG.DB, target.degs, target.genes)
-  {
-    
-    if (!is.data.frame(TFTG.DB))
-      stop("TFTG.DB must be a data frame or tibble object")
-    if (!"source" %in% colnames(TFTG.DB))
-      stop("TFTG.DB must contain a column named 'source'")
-    if (!"target" %in% colnames(TFTG.DB))
-      stop("TFTG.DB must contain a column named 'target'")
-    
-    # get TF list
-    TF.list <- TFTG.DB %>% select(source) %>% unlist() %>% unique()
-    
-    # get Target list
-    TG.list <- lapply(TF.list, function(x){
-      TFTG.DB %>% filter(source == x)  %>% select(target) %>% unlist() %>% unique() %>% intersect(.,target.genes)
-    })
-    names(TG.list) <- TF.list
-    
-    # get target differently expressed genes
-    DEGs <- target.degs
-    
-    # perform fisher test
-    TFs <- lapply(TG.list, function(x){fisher_test(subset1 = x, subset2 = DEGs, backgrond = target.genes)})
-    TFs <- unlist(TFs)
-    TFs <- names(TFs)[TFs <= 0.05]
-    TFs <- TFs[TFs %in% target.genes]
-    
-    # get activated LR pairs
-    TFTGList <- TG.list[TFs]
-    TFTGList <- lapply(TFTGList, function(x){intersect(x, DEGs)})
-    TFTGList <- paste(rep(TFs, times = lengths(TFTGList)), unlist(TFTGList), sep = "_")
-    
-    # check result
-    if(length(TFTGList)==0)
-      stop("Error: No significant TFTG pairs")
-    
-    # get result
-    TFTGTable <- TFTGList %>% strsplit(.,split = "_") %>% do.call(rbind, .) %>% as.data.frame()
-    colnames(TFTGTable) <- c("source","target")
-    
-    cat(paste0("get ",length(TFTGList)," activated TFTG pairs\n"))
-    return(TFTGTable)
-    
-  }
-  
   target_gene <- rownames(meanExprMat)
   target_deg <- DEGs_list[[reciver]]
   tryCatch({
@@ -316,59 +302,6 @@ runMLnet <- function(sender,reciver,rank.cutoff=0.2){
   if(!tag1) return(NULL)
   
   ## get RecTF ################
-  
-  getRecTF <- function(RecTF.DB, Rec.list, TF.list)
-  {
-    
-    if (!is.data.frame(RecTF.DB))
-      stop("RecTF.DB must be a data frame or tibble object")
-    if (!"source" %in% colnames(RecTF.DB))
-      stop("RecTF.DB must contain a column named 'source'")
-    if (!"target" %in% colnames(RecTF.DB))
-      stop("RecTF.DB must contain a column named 'target'")
-    
-    # make sure Rec.list in RecTF.DB
-    Rec.list <- Rec.list[Rec.list %in% RecTF.DB$source]
-    Rec.list <- as.vector(Rec.list)
-    
-    # make sure TF.list in RecTF.DB
-    TF.list <- TF.list[TF.list %in% RecTF.DB$target]
-    TF.list <- as.vector(TF.list)
-    
-    # get TF activated by Receptors
-    TFofRec <- lapply(Rec.list, function(x){
-      RecTF.DB %>% filter(source == x)  %>% select(target) %>% unlist() %>% unique()
-    })
-    names(TFofRec) <- Rec.list
-    
-    # get all TF
-    TFofALL <- RecTF.DB %>% select(target) %>% unlist() %>% unique()
-    
-    # perform fisher test
-    Recs <- lapply(TFofRec, function(x){
-      fisher_test(subset1 = x, subset2 = TF.list, backgrond = TFofALL)
-    })
-    Recs <- unlist(Recs)
-    Recs <- names(Recs)[Recs <= 0.05]
-    Recs <- Recs[Recs %in% target_gene]
-    
-    # get activated RecTF pairs
-    RecTFList <- TFofRec[Recs]
-    RecTFList <- lapply(RecTFList, function(x){intersect(x, TF.list)})
-    RecTFList <- paste(rep(Recs, times = lengths(RecTFList)), unlist(RecTFList), sep = "_")
-    
-    # check result
-    if(length(RecTFList)==0)
-      stop("Error: No significant RecTF pairs")
-    
-    # get result
-    RecTFTable <- RecTFList %>% strsplit(.,split = "_") %>% do.call(rbind, .) %>% as.data.frame()
-    colnames(RecTFTable) <- c("source","target")
-    
-    cat(paste0("get ",length(RecTFList)," activated RecTF pairs\n"))
-    return(RecTFTable)
-    
-  }
   
   Rec.list <- LigRec$target %>% as.character() %>% unique()
   TF.list <- TFTG$source %>% as.character() %>% unique()
@@ -402,46 +335,6 @@ runMLnet <- function(sender,reciver,rank.cutoff=0.2){
   
 }
 
-## perform ########
-
-df_cellpair <- paste(rep(cts,each=length(cts)), rep(cts,times=length(cts)), sep = "_")
-df_cellpair <- lapply(df_cellpair, function(x){strsplit(x,"_")[[1]]}) %>% do.call("rbind",.)
-df_cellpair <- df_cellpair[apply(df_cellpair, 1, function(x){x[1]!=x[2]}),]
-df_cellpair <- data.frame(df_cellpair)
-colnames(df_cellpair) <- c("sender","receiver")
-
-MLnet <- apply(df_cellpair, 1, function(cp){
-  
-  cat(paste0("sender: ",cp[1],'\n'))
-  cat(paste0("receiver: ",cp[2],'\n'))
-  res <- runMLnet(cp[1],cp[2])
-  cat("###########################\n")
-  res
-  
-})
-names(MLnet) <- paste(df_cellpair$sender, df_cellpair$receiver, sep = "_")
-str(MLnet)
-saveRDS(MLnet, "./result/MLnet.rds")
-
-## plot input #################
-
-rm(list = ls())
-MLnet <- readRDS("./result/MLnet.rds")
-df_cellpair <- data.frame(sender = lapply(names(MLnet), function(x){strsplit(x,"_")[[1]][1]}) %>% unlist(),
-                          receiver = lapply(names(MLnet), function(x){strsplit(x,"_")[[1]][2]}) %>% unlist())
-
-## plot communication network in microenvironment #######
-
-# library
-library(Matrix)
-library(dplyr)
-library(ggplot2)
-library(igraph)
-
-# install.packages("plotrix")
-library(plotrix)
-
-# function 
 DrawLeg <- function(alltype,allcolos,xstart,ystart,cirr,jiange)
 {
   ThisX <- xstart
@@ -458,15 +351,18 @@ DrawLeg <- function(alltype,allcolos,xstart,ystart,cirr,jiange)
 
 DrawCellComm <- function(CellTab,colodb)
 {
+  
   aaa <- CellTab
   g <- graph.data.frame(aaa,directed=TRUE)
+  
   alltype <- c(aaa$cell_from,aaa$cell_to)
   alltype <- unique(alltype)
-  # allcolos <- rainbow(length(alltype))
-  ChoColorNum <- 1:length(alltype) # sample(1:length(colodb),length(alltype), replace = FALSE)
-  
-  allcolos <- colodb[ChoColorNum]
-  names(allcolos) <- alltype
+  if(is.null(names(colodb))){
+    allcolos <- colodb
+    names(allcolos) <- alltype
+  }else{
+    allcolos <- colodb
+  }
   
   edge.start <- ends(g,es=E(g),names=FALSE)
   
@@ -526,11 +422,120 @@ DrawCellComm <- function(CellTab,colodb)
   
 }
 
-# color
-colodb <- mycols_seur[c(2,4,3,1)]
-show_col(colodb)
+## Database
 
-# plot input
+ppi_form_kinaseextra <- import_kinaseextra_interactions() 
+ppi_form_omnipath <- import_omnipath_interactions() 
+ppi_form_pathwayextra <- import_pathwayextra_interactions() 
+ppi_from_Omnipath <- rbind(ppi_form_kinaseextra,ppi_form_omnipath,ppi_form_pathwayextra) # 101590 pairs
+ppiDB <- ppi_from_Omnipath %>% dplyr::filter(n_resources>0) %>% 
+  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
+  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
+  dplyr::filter(source %in% rownames(meanExprMat), target %in% rownames(meanExprMat))
+
+LigRecDB <- import_ligrecextra_interactions()
+LigRecDB <- LigRecDB %>% 
+  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
+  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
+  dplyr::filter(source %in% unique(c(ppiDB$source,ppiDB$target)), 
+                target %in% unique(c(ppiDB$source,ppiDB$target)))
+
+TFTG_from_dorothea <- import_dorothea_interactions() 
+TFTG_from_tftarget <- import_tf_target_interactions() 
+TFTGDB <- rbind(TFTG_from_dorothea[,-grep("dorothea_level",colnames(TFTG_from_dorothea))],
+                TFTG_from_tftarget) # 77182 pairs
+TFTGDB <- TFTGDB %>% 
+  dplyr::select(source_genesymbol, target_genesymbol, n_resources) %>%
+  dplyr::rename(source=source_genesymbol, target=target_genesymbol, weight = n_resources) %>%
+  dplyr::filter(source %in% unique(c(ppiDB$source,ppiDB$target)), 
+                target %in% unique(c(ppiDB$source,ppiDB$target))) 
+
+Database <- list(LigRecDB = LigRecDB,
+                 ppiDB = ppiDB,
+                 TFTGDB = TFTGDB)
+saveRDS(Database, "./result/database.rds")
+
+V = unique(c(ppiDB$source,ppiDB$target))
+adjM <- matrix(0,nrow = length(V),ncol = length(V), dimnames = list(V,V))
+for(i in 1:nrow(ppiDB)){
+  
+  adjM[ppiDB$source[i],ppiDB$target[i]] <- 1/ppiDB$weight[i]
+  adjM[ppiDB$target[i],ppiDB$source[i]] <- 1/ppiDB$weight[i]
+  
+}
+adjM <- as(adjM, "dgCMatrix")
+
+G <- igraph::graph_from_adjacency_matrix(adjM, mode='undirected', weighted=TRUE)
+G <- igraph::simplify(G, remove.multiple = TRUE, remove.loops = TRUE)
+isolates <- which(degree(G, mode = c("all")) == 0) - 1
+G <- delete.vertices(G, names(isolates))
+
+Receptors <- LigRecDB$target %>% as.character() %>% unique()
+TFs <- TFTGDB$source %>% as.character() %>% unique()
+distM <- lapply(Receptors, function(rec){
+  
+  distances(G, v = rec, to = TFs)
+  
+}) %>% do.call("rbind",.) %>% as.data.frame()
+rownames(distM) <- Receptors
+colnames(distM) <- TFs
+
+score.cutoff = 0.2
+RecTFDB <- distM
+RecTFDB <- cbind(rownames(RecTFDB),RecTFDB)
+RecTFDB <- reshape2::melt(RecTFDB, id = "rownames(RecTFDB)")
+colnames(RecTFDB) <- c('source','target','score')
+RecTFDB <- RecTFDB %>%
+  dplyr::filter(score != Inf, score != 0) %>%
+  dplyr::filter(score <= quantile(score, score.cutoff))
+
+saveRDS(RecTFDB, "./result/RecTFDB.rds")
+
+## input
+
+seur <- readRDS("./result/seur.rds")
+metadata <- data.frame(barcode = rownames(seur@meta.data),
+                       celltype = seur@active.ident)
+
+cts <- metadata$celltype %>% unique()
+meanExprMat <- lapply(cts, function(ct){
+  
+  exprMat <- seur[['alra']]@data
+  meanExpr <- rowMeans(exprMat[, seur@active.ident == ct])
+  
+}) %>% do.call("cbind",.) %>% as.data.frame()
+colnames(meanExprMat) <- cts
+
+AllMarkers <- read.csv("./result/all.markers.alra.csv",row.names = 1)
+DEGs_list <- split(AllMarkers$gene,AllMarkers$cluster)
+
+## run
+
+df_cellpair <- paste(rep(cts,each=length(cts)), rep(cts,times=length(cts)), sep = "_")
+df_cellpair <- lapply(df_cellpair, function(x){strsplit(x,"_")[[1]]}) %>% do.call("rbind",.)
+df_cellpair <- df_cellpair[apply(df_cellpair, 1, function(x){x[1]!=x[2]}),]
+df_cellpair <- data.frame(df_cellpair)
+colnames(df_cellpair) <- c("sender","receiver")
+
+MLnet <- apply(df_cellpair, 1, function(cp){
+  
+  cat(paste0("sender: ",cp[1],'\n'))
+  cat(paste0("receiver: ",cp[2],'\n'))
+  res <- runMLnet(cp[1],cp[2])
+  cat("###########################\n")
+  res
+  
+})
+names(MLnet) <- paste(df_cellpair$sender, df_cellpair$receiver, sep = "_")
+str(MLnet)
+saveRDS(MLnet, "./result/MLnet.rds")
+
+## cell_comm
+
+MLnet <- readRDS("./result/MLnet.rds")
+df_cellpair <- data.frame(sender = lapply(names(MLnet), function(x){strsplit(x,"_")[[1]][1]}) %>% unlist(),
+                          receiver = lapply(names(MLnet), function(x){strsplit(x,"_")[[1]][2]}) %>% unlist())
+
 LRtab <- df_cellpair
 colnames(LRtab) <- c('cell_from','cell_to')
 LRtab$n <- lapply(MLnet,function(net){
@@ -543,16 +548,27 @@ LRtab$n <- lapply(MLnet,function(net){
   
 }) %>% unlist()
 
-# plot
+colodb <- mycols_seur[c(2,4,3,1)]
+show_col(colodb)
+
 pdf("./result/cell_comm.pdf",height = 10,width = 20)
 DrawCellComm(LRtab,colodb)
 dev.off()
 
-## plot Gal-9-Tim-3-x-M2 network ###########
+## Multilayer network
 
-# plot input
 lig = "LGALS9"
 rec = "HAVCR2"
+
+m2tgs <- read.csv('./cci/M2 marker genes.csv',header = F)
+m2tgs <- unlist(m2tgs) %>% .[.!='']
+human <- biomaRt::useMart('ensembl',dataset = 'hsapiens_gene_ensembl')
+mouse <- biomaRt::useMart('ensembl',dataset = 'mmusculus_gene_ensembl')
+m2tgs <- biomaRt::getLDS(attributes = 'mgi_symbol',filters = 'mgi_symbol',
+                       values = m2tgs, mart = mouse,
+                       attributesL = 'hgnc_symbol',martL = human,uniqueRows = T)
+m2tgs <- m2tgs$HGNC.symbol
+
 mlnet_m2 <- list(LigRec = data.frame(source = lig, target = rec),
                  RecTF = mlnet$RecTF[mlnet$RecTF$source %in% rec & mlnet$RecTF$target %in% tfs,],
                  TFTar = mlnet$TFTG[mlnet$TFTG$source %in% tfs & mlnet$TFTG$target %in% m2tgs,])
@@ -564,15 +580,10 @@ df_nodes$key <- c('Ligand','Receptor',
                   rep('TF',length(intersect(df_nodes$node,tfs))),
                   rep('Target',length(intersect(df_nodes$node,m2tgs))))
 
-# color
-library(RColorBrewer)
 coul <- brewer.pal(nlevels(as.factor(df_nodes$key)), "Set2")
-my_color <- coul[as.numeric(as.factor(df_nodes$key))]
+mycolor_key <- coul[as.numeric(as.factor(df_nodes$key))]
 
-# plot
-
-# pdf("./result/network_reingold.tilford.pdf")
-
+# pdf("./result/multilayer_network.pdf")
 network <- graph_from_edgelist(as.matrix(df_edges[,1:2]))
 par(bg="white", mar=c(0,0,0,3))
 set.seed(4)
@@ -587,19 +598,23 @@ plot(network,
      edge.arrow.width=0.8,   
      layout = layout.reingold.tilford
 )
-
 legend(x=1.1, y=-0.5, 
        legend=levels(as.factor(df_nodes$key)), 
        col = coul , 
        bty = "n", pch=20 , pt.cex = 2, cex = 1,
        text.col="black" , horiz = F)
-
 # dev.off()
 
-#################################
-## Enrichment analysis Tim3-up ##
-#################################
-## library ###########
+###########################################################################
+#
+# Enrichment analysis
+#
+###########################################################################
+
+## library 
+
+rm(list = ls())
+gc()
 
 library(Seurat) 
 library(org.Hs.eg.db)
@@ -607,14 +622,12 @@ library(clusterProfiler)
 library(enrichplot)
 library(ggplot2)
 
-# BiocManager::install("ggsci")
+## color
 
-library(RColorBrewer)
-display.brewer.all()
-mycols <- brewer.pal(11, "RdBu")
-mycols <- mycols[c(1,4)]
+mycols <- c('#F8766D','white')
+scales::show_col(mycols)
 
-## genelist ############
+## genelist
 
 MLnet <- readRDS("./result/MLnet.rds")
 MLnet <- MLnet$Malignant_macrophages
@@ -626,19 +639,19 @@ g2s <- toTable(org.Hs.egSYMBOL)
 geneList <- g2s$gene_id[match(geneList,g2s$symbol)]
 geneList <- na.omit(geneList)
 
-## GO ###########
+## GO enrichment
 
 enrich_gobp <- enrichGO(geneList, 'org.Hs.eg.db', ont="BP", keyType = 'ENTREZID', 
                         minGSSize = 1, pvalueCutoff = 0.99)
-str(enrich_gobp) # 6372 genesets
+str(enrich_gobp) 
 
 res_enrich_gobp <- enrich_gobp@result
 res_enrich_gobp <- res_enrich_gobp[res_enrich_gobp$p.adjust <= 0.05,]
 
 hit_terms <- res_enrich_gobp$Description
-hit_terms[grep("macrophage activation",hit_terms,ignore.case = T)] # 3 terms
-hit_terms[grep("vessel",hit_terms,ignore.case = T)] # 2 terms
-hit_terms[grep("vasculature",hit_terms,ignore.case = T)] # 2 terms
+hit_terms[grep("macrophage activation",hit_terms,ignore.case = T)] 
+hit_terms[grep("vessel",hit_terms,ignore.case = T)]
+hit_terms[grep("vasculature",hit_terms,ignore.case = T)]
 
 hits <- res_enrich_gobp$Description[grep("macrophage activation|vessel diameter|of vasculature development",
                                          res_enrich_gobp$Description,ignore.case = T)]
@@ -657,10 +670,10 @@ p1 <- ggplot(res_enrich_gobp_hits, aes(x = GeneRatio, y = reorder(Description ,G
 p1
 # dev.off()
 
-## KEGG ##############
+## KEGG enrichment
 
 enrich_kegg <- enrichKEGG(geneList, minGSSize = 1, pvalueCutoff = 0.99)
-str(enrich_kegg) # 274 genesets
+str(enrich_kegg) 
 
 res_enrich_kegg <- enrich_kegg@result
 res_enrich_kegg <- res_enrich_kegg[res_enrich_kegg$p.adjust <= 0.05,]
@@ -687,48 +700,50 @@ pdf("./result/gsea/enrich.pdf", width = 8, height = 5)
 ggpubr::ggarrange(p1,p2,ncol = 1,align = "hv",heights = c(2,3))
 dev.off()
 
-###################
-## GSEA analysis ##
-###################
-## library ########
+###########################################################################
+#
+# GSEA analysis
+#
+###########################################################################
+
+## library
 
 rm(list = ls())
+gc()
 
 library(Seurat)
 library(clusterProfiler)
 library(enrichplot)
 
-# BiocManager::install('GSEABase')
 library(GSEABase) 
 
-# BiocManager::install("ggsci")
 library(ggsci)
+
+## color
+
 mycols <- pal_lancet("lanonc", alpha = 0.7)(9)
 
-## load input ###########
+## genelist
 
 seur <- readRDS("./result/seur.rds")
 DefaultAssay(seur) <- 'alra'
 degs.all <- FindMarkers(seur, ident.1 = "macrophages", logfc.threshold = 0.01, only.pos = FALSE)
 
-## genelist ############
-
-geneList <-  degs
+geneList <-  degs.all
 geneList <- geneList$avg_log2FC
 names(geneList) = rownames(degs)
 geneList <- geneList[degs$pct.1>=0.1]
 geneList <- geneList[order(geneList, decreasing = T)]
 
-## GO ############
+## GO
 
 gmtfile ='./msigDB/c5.go.bp.v7.4.symbols.gmt'
 geneset <- read.gmt(gmtfile)
 geneset$term <- geneset$term %>% tolower()
 length(unique(geneset$term))
-# 7481 genesets
 
 gsea_gobp <- GSEA(geneList, TERM2GENE=geneset, minGSSize = 1, pvalueCutoff = 0.99, verbose=FALSE, seed = 10)
-str(gsea_gobp) # 7192 genesets
+str(gsea_gobp) 
 
 res_gsea_gobp <- gsea_gobp@result
 res_gsea_gobp <- res_gsea_gobp[res_gsea_gobp$p.adjust <= 0.05,]

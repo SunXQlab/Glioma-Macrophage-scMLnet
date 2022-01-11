@@ -398,7 +398,7 @@ ggsave("./cnv/res_kmeans_celltype_score.pdf",width = 5,height = 3.8)
 #
 ###########################################################################
 
-## library 
+## library
 
 library(Seurat)
 library(dplyr)
@@ -986,6 +986,15 @@ mlnet$TFTG <- mlnet$TFTG[mlnet$TFTG$source %in% mlnet$RecTF$target,]
 xlsx::write.xlsx(mlnet$LigRec,file = './cci/M47/mlnet/MLnet_LGALS9_HAVCR2.xlsx',sheetName = 'LigRec',row.names = F)
 xlsx::write.xlsx(mlnet$RecTF,file = './cci/M47/mlnet/MLnet_LGALS9_HAVCR2.xlsx',sheetName = 'RecTF',row.names = F,append = T)
 xlsx::write.xlsx(mlnet$TFTG,file = './cci/M47/mlnet/MLnet_LGALS9_HAVCR2.xlsx',sheetName = 'TFTG',row.names = F,append = T)
+
+m2m <- read.csv('./cci/M2 marker genes.csv',header = F)
+m2m <- unlist(m2m) %>% .[.!='']
+human <- biomaRt::useMart('ensembl',dataset = 'hsapiens_gene_ensembl')
+mouse <- biomaRt::useMart('ensembl',dataset = 'mmusculus_gene_ensembl')
+m2m <- biomaRt::getLDS(attributes = 'mgi_symbol',filters = 'mgi_symbol',
+                       values = m2m, mart = mouse,
+                       attributesL = 'hgnc_symbol',martL = human,uniqueRows = T)
+m2m <- m2m$HGNC.symbol
 
 mlnet <- MLnet$Malignant_Macrophages
 mlnet$LigRec <- mlnet$LigRec[mlnet$LigRec$source %in% lig & mlnet$LigRec$target %in% rec,]
